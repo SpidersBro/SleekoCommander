@@ -1,0 +1,694 @@
+#!/usr/bin/env python2
+
+# Name:  SleekoCommander
+# Author:  Nick Caplinger aka SleekoNiko
+# Dependencies:  numpy
+# Notes:  I guess I should go ahead and upload this simple commander and see where it stands.
+#         P.S. I love you.
+
+# (02:17:10 AM) AJC: try this, randomly pick points until you have a desired number of graph nodes.
+# (02:17:29 AM) AJC: then assign all the cells to the nearest graph node
+# (02:17:47 AM) AJC: then iteratively go through and balance out the nodes, stealing from the fat and giving to the thin
+# (02:17:56 AM) AJC: until your areas are roughly even
+# (02:18:07 AM) AJC: then you should have a good enough graph
+
+# Modules to consider:
+# graph-tool
+# numpy
+
+# Ideas:
+# attackers study timing of defenders
+# control the midfield with gankers - betweenEnemyCarrierAndScoreZone method or shorter:  canInterceptCarrier
+# determine best defending position
+
+# Import AI Sandbox API:
+from api import Commander
+from api import commands
+from api import Vector2
+
+# Import other modules
+import random
+import numpy # for 2D arrays
+import png # for writing debug pngs
+
+class SleekoCommander(Commander):
+    """
+    Runners are responsible for infiltrating the enemy's defenses by flanking.
+    Defenders watch the flag stand for intruders and flankers by positioning themselves accordingly.
+    Midfielders try to provide map control by ganking and performing midfield objectives such as escorting and interception.  They may fall into other roles when needed.
+
+    """
+
+    def initialize(self):
+        #self.log.info("--INITIALIZING--")
+        """
+        Assign each bot a role.  Runners and defenders should default to 40%, and midfielders should default to 20%.
+        Role counts should adapt throughout the game depending on how aggressive or defensive the enemy commander is.
+        """
+        self.verbose = True    # display the command descriptions next to the bot labels
+        
+        self.lastEventCount = 0
+        self.numAllies = len(self.game.team.members)
+        
+        self.runners = [] # 40%
+        self.defenders = [] # 40%
+        self.midfielders = [] # 20%
+
+        self.minRunners = int(self.numAllies * .4)
+        self.minDefenders = int(self.numAllies * .2)
+        self.minMidfielders = int(self.numAllies - (self.minRunners + self.minDefenders))
+
+        # Assign roles in order of importance
+        # for bot in self.game.team.members:
+        #     if len(self.runners) < self.minRunners:
+        #         self.runners.append(bot)
+        #     elif len(self.defenders) < self.minDefenders:
+        #         self.defenders.append(bot)
+        #     else:
+        #         self.midfielders.append(bot)
+
+        # if their spawn is closer to our flag than ours is
+        # attacking will probably be easy, so get more defenders
+        ourSpawn = self.game.team.botSpawnArea[0]
+        theirSpawn = self.game.enemyTeam.botSpawnArea[0]
+        if distTo(theirSpawn, self.game.team.flag.position) < distTo(ourSpawn, self.game.team.flag.position):
+            #we need more defenders
+            numMems = len(self.game.team.members)
+            for bot in self.game.team.members:
+                if len(self.runners) > 0 and len(self.defenders) < numMems/2:
+                    self.defenders.append(bot)
+                else:
+                    self.runners.append(bot)
+        else:
+            self.defenders.append(self.game.team.members[0])
+            for bot in self.game.team.members:
+                if not bot in self.defenders:
+                    self.runners.append(bot)
+        #for bot in self.game.team.members:
+            #self.defenders.append(bot)
+
+        # TODO calculate for more than 2 flags
+        self.midPoint = (self.game.team.botSpawnArea[0] + self.game.enemyTeam.flag.position) / 2.0
+
+        dirToFlag = (self.game.enemyTeam.flag.position - self.game.team.flag.position)
+        self.frontFlank = Vector2(dirToFlag.x, dirToFlag.y).normalized()
+        self.leftFlank = Vector2(dirToFlag.y,-dirToFlag.x).normalized()
+        self.rightFlank = Vector2(-dirToFlag.y,dirToFlag.x).normalized()
+        
+        # Create behavior tree
+        #print "Try to make tree"
+        self.behaviorTree = BotBehaviorTree(
+            Selector([
+                    Sequence([
+                            BotIsRunner(),
+                            Selector([
+                                    Sequence([
+                                            BotHasFlag(),
+                                            RunToScoreZone()
+                                            ]),
+                                    Sequence([
+                                            AllyHasFlag(),
+                                            SecureEnemyFlagObjective()
+                                            ]),
+                                    Sequence([ 
+                                            Inverter(TeamHasEnemyFlag()), 
+                                            Selector([
+                                                    Sequence([
+                                                            NearEnemyFlag(),
+                                                            Selector([
+                                                                    Sequence([
+                                                                            EnemiesAreAlive(),
+                                                                            AttackFlag()
+                                                                            ]),
+                                                                    ChargeFlag()
+                                                                    ])
+                                                            ]),
+                                                    ChargeToFlagFlank()
+                                                    ])
+                                            ])
+                                    ])
+                            ]),
+                    Sequence([
+                            BotIsDefender(),
+                            Selector([
+                                    Sequence([
+                                            BotHasFlag(),
+                                            RunToScoreZone()
+                                            ]),
+                                    Sequence([
+                                            OurFlagIsInBase(),
+                                            SecureOurFlagStand()
+                                            ]),
+                                    Sequence([
+                                            OurFlagIsOnOurHalf(),
+                                            SecureOurFlag()
+                                            ]),
+                                    Sequence([
+                                            SecureOurFlagStand()
+                                            ])
+                                    ])
+                            ])
+                    ])
+        )
+
+        # Set some blackboard data
+        self.behaviorTree.root.blackboard = {}
+        self.behaviorTree.root.blackboard['commander'] = self
+
+        # testing
+        #bt = getVonNeumannNeighborhood((int(self.game.team.flagSpawnLocation.x), int(self.game.team.flagSpawnLocation.y)), self.level.blockHeights, int(self.level.firingDistance))
+        #createPngFromBlockTuples(bt, (self.level.width, self.level.height))
+        self.secureFlagDefenseLocs = self.getMostSecurePositions(Vector2(self.game.team.flagSpawnLocation.x, self.game.team.flagSpawnLocation.y))
+        #createPngFromMatrix(bt, (self.level.width, self.level.height))
+
+    def tick(self):
+        """
+        
+        """
+        
+        #TODO Make bots more aggressive when time is running out and losing
+        #TODO Make bots more defensive when time is running out and winning
+
+        ourFlagScorePos = self.game.team.flagScoreLocation
+        theirFlagScorePos = self.game.enemyTeam.flagScoreLocation
+
+        ourFlagSpawnPos = self.game.team.flagSpawnLocation
+        theirFlagSpawnPos = self.game.enemyTeam.flagSpawnLocation
+
+        ourFlagPos = self.game.team.flag.position
+        theirFlagPos = self.game.enemyTeam.flag.position
+
+        # listen for events
+        if len(self.game.match.combatEvents) > self.lastEventCount:
+            lastCombatEvent = self.game.match.combatEvents[-1]
+            #self.log.info('event:'+str(lastCombatEvent.type))
+            # if lastCombatEvent.instigator is not None:
+            #     print "event:%d %f %s %s" % (lastCombatEvent.type,lastCombatEvent.time,lastCombatEvent.instigator.name,lastCombatEvent.subject.name)
+            # else:
+            #     print "event:%d %f" % (lastCombatEvent.type,lastCombatEvent.time)
+            self.lastEventCount = len(self.game.match.combatEvents)
+
+
+        # run behavior tree
+        for bot in self.game.bots_alive:
+            self.behaviorTree.root.blackboard['bot'] = bot
+            self.behaviorTree.run()
+
+
+
+    def shutdown(self):
+        # self.log.info("--END MATCH SCORE--")
+        # scoreItems = self.game.match.scores.items()
+        # self.log.info(str(scoreItems))
+        # for team, score in scoreItems:
+        #     self.log.info(team + ": " + str(score))
+        #     self.log.info("Our Name:  " + self.game.team.name)
+        #     self.log.info("Their Name:  " + self.game.enemyTeam.name)
+        scoreDict = self.game.match.scores
+        myScore = scoreDict[self.game.team.name]
+        theirScore = scoreDict[self.game.enemyTeam.name]
+
+        if myScore < theirScore:
+            self.log.info("We lost! Final score: " + str(myScore) + "-" + str(theirScore))
+            #self.log.info("Map was:  "
+        
+    """
+    Returns most secure positions by using von Neumann neighborhood where r = firingDistance + 2
+    """
+    def getMostSecurePositions(self,secLoc):
+        levelSize = (self.level.width, self.level.height)
+        width, height = levelSize
+        potPosits = [[0 for y in xrange(height)] for x in xrange(width)]
+        neighbors = getVonNeumannNeighborhood((int(secLoc.x), int(secLoc.y)), self.level.blockHeights, int(self.level.firingDistance)+2)
+        securePositions = []
+        
+        for n in neighbors:
+            # use raycasting to test whether or not this position can see the flag
+            # if it can't, automatically set it to 0
+            x,y = n
+
+            if self.level.blockHeights[x][y] >= 2:
+                potPosits[x][y] = 50
+            else:
+                potPosits[x][y] = 255
+                
+            if potPosits[x][y] == 255:
+                numWallCells = numAdjCoverBlocks(n, self.level.blockHeights)
+                numWallCells += numAdjMapWalls(n, levelSize)
+                #print numWallCells
+                if numWallCells == 0:
+                    potPosits[x][y] = 128
+                if potPosits[x][y] == 255:
+                    # make sure they have LOS with the flag
+                    goodLOS = True
+                    lookVec = Vector2(x+0.5,y+0.5) - (secLoc + Vector2(.5,.5))
+                    lookVecNorm = lookVec.normalized()
+                    vecInc = .1
+                    while vecInc < lookVec.length():
+                        testPos = secLoc + lookVecNorm * vecInc
+                        #print str(testPos)
+                        if self.level.blockHeights[int(testPos.x)][int(testPos.y)] >= 2:
+                            goodLOS = False
+                            break
+                        vecInc += .1
+                    if not goodLOS:
+                        potPosits[x][y] = 128
+                    else:
+                        securePositions.append(n)
+        #createPngFromMatrix(potPosits, levelSize)
+        
+        return sorted(securePositions, key = lambda p: numAdjMapWalls(p, levelSize)*4 + numAdjCoverBlocksWeighted(p, self) + distTo(Vector2(p[0],p[1]), secLoc)/self.level.firingDistance, reverse = True)
+                            
+                            
+    def getFlankingPosition(self, bot, target):
+        flanks = [target + f * self.level.firingDistance for f in [self.leftFlank, self.rightFlank]]
+        options = map(lambda f: self.level.findNearestFreePosition(f), flanks)
+        #return sorted(options, key = lambda p: (bot.position - p).length())[0]
+        return random.choice(options)
+
+    # return number of living enemies
+    def numAliveEnemies(self):
+        livingEnemies = 0
+        for bot in self.game.enemyTeam.members:
+            if bot.health != None and bot.health > 0:
+                livingEnemies += 1
+        return livingEnemies
+
+# Helper functions
+def distTo(pos1, pos2):
+    return (pos1 - pos2).length()
+
+def canInterceptTarget(bot, target, targetGoal):  # used for intercepting enemy flag runners
+    return distTo(bot, targetGoal) < distTo(target, targetGoal)
+
+def numAdjCoverBlocks(cell, blockHeights):
+    adjCells = getVonNeumannNeighborhood(cell, blockHeights, 1)
+    numWallCells = 0
+    for aCell in adjCells:
+        aCellX, aCellY = aCell
+        if blockHeights[aCellX][aCellY] >= 2:
+            numWallCells += 1
+    return numWallCells
+
+def unblockedDistInDir(startPos, direction, commander):
+    testPos = startPos
+    while withinLevelBounds(testPos, (commander.level.width, commander.level.height)):
+        if commander.level.blockHeights[int(testPos.x)][int(testPos.y)] < 2:
+            testPos = testPos + direction/2
+        else:
+            break
+
+    return distTo(startPos, testPos)
+
+def withinLevelBounds(pos, levelSize):
+    return pos.x >= 0 and pos.y >= 0 and pos.x < levelSize[0] and pos.y < levelSize[1]
+
+# prioritize cells that have cover from their spawn
+def numAdjCoverBlocksWeighted(cell, cmdr):
+    adjCells = getVonNeumannNeighborhood(cell, cmdr.level.blockHeights, 1)
+    # get distances of cells to their spawn
+    spawnPoint = cmdr.game.enemyTeam.botSpawnArea[0]
+    cellDistances = [distTo(spawnPoint, Vector2(x[0] + .5, x[1] + .5)) for x in adjCells]
+    cellDistData = sorted(zip(adjCells, cellDistances), key = lambda x: x[1], reverse = True)
+    #print str(cellDistData)
+    
+    #print "Getting wallScore for " + str(cell)
+    wallScore = 0
+    for i, aCell in enumerate([x[0] for x in cellDistData]):
+        if not aCell == cell:
+            aCellX, aCellY = aCell
+            if cmdr.level.blockHeights[aCellX][aCellY] >= 2:
+                #print str(aCell) + " " + str(i)
+                wallScore += i
+            #wallScore += cellDistDict[aCell]
+            #wallScore += #position of element in cellDistDict
+    #print "Thus wallScore is " + str(wallScore)
+    return wallScore
+
+def numAdjMapWalls(cell, mapSize):
+    adjWalls = 0
+    x,y = cell
+    width,height = mapSize
+
+    if x == 0 or x == width-1:
+        adjWalls += 1
+    if y == 0 or y == height-1:
+        adjWalls += 1
+    return adjWalls
+    
+def getVonNeumannNeighborhood(cell, cells, r): # where cell is a tuple, cells is a 2D list, and r is the range
+    newCells = [] # list of tuples
+    for x, cx in enumerate(cells):
+        for y, cy in enumerate(cx):
+            #print str(x) + ", " + str(y)
+            if abs(x - cell[0]) + abs(y - cell[1]) <= r:
+                newCells.append((x,y))
+    return newCells
+
+def createPngFromBlockTuples(tupleList, levelSize, name='pngtest.png'): # where tupleList is a list of block position tuples, levelSize is a tuple of x,y level size
+    width, height = levelSize
+    pngList = [[0 for y in xrange(height)] for x in xrange(width)]
+    for t in tupleList: # I could probably use list comprehensions here
+        print str(t)
+        x,y = t
+        #print str(x) + ", " + str(y)
+        column = pngList[y]
+        #print row
+        column[x] = 255
+    #print pngList
+    image = png.from_array(pngList, mode='L') # grayscale
+    image.save(name)
+
+def createPngFromMatrix(matrix, levelSize, name='pngtest.png'):
+    width, height = levelSize
+    transposedMatrix = [[row[i] for row in matrix] for i in xrange(height)]
+    image = png.from_array(transposedMatrix, mode='L')
+    image.save(name)
+
+# Base class for bot behavior tree 
+# Nothing special; just trying to get the job done
+class BotBehaviorTree:
+    def __init__(self, child=None):
+        self.root = child
+
+    def run(self):
+        self.root.run()
+
+# Base task classes
+class Task:
+    def __init__(self, children=None, parent=None, blackboard=None):
+        #holds the children of task
+        self.children = children
+        self.blackboard = blackboard
+        self.parent = parent
+
+        if self.children != None:
+            for c in self.children:
+                c.parent = self
+    
+    # returns True for success and False for failure
+    def run(self):
+        raise NotImplementedError("Can't call Task.run() without defining behavior.")
+
+    # Get data from the dict blackboard
+    def getData(self, name):
+        #print "Getting data.  Node is " + str(self) + " with parent of " + str(self.parent)
+        if self.blackboard == None or (self.blackboard != None and not name in blackboard):
+            testParent = self.parent
+            while testParent != None:
+                if testParent.blackboard != None and name in testParent.blackboard:
+                    #print "Found it in testParent = " + str(testParent)
+                    return testParent.blackboard[name]
+                else:
+                    testParent = testParent.parent
+                    #print "Going up a node; new testParent = " + str(testParent)
+            # We went through the parents and didn't find anything...
+            return None
+        else:
+            return blackboard[name]
+
+class Selector (Task):
+    def run(self):
+        for c in self.children:
+            if c.run():
+                return True
+
+        return False
+
+class Sequence (Task):
+    def run(self):
+        for c in self.children:
+            if not c.run():
+                return False
+
+        return True
+
+# Decorators
+
+class Decorator (Task):
+    def __init__(self, child=None,parent=None,blackboard=None):
+        self.child = child
+        self.parent = parent
+        self.blackboard = blackboard
+
+        self.child.parent = self
+
+class Inverter (Decorator):
+    def run(self):
+        return not self.child.run()
+
+# Now onto tasks specific to our program:
+
+class BotIsRunner(Task):
+    def run(self):
+        return self.getData('bot') in self.getData('commander').runners
+
+class BotIsDefender(Task):
+    def run(self):
+        return self.getData('bot') in self.getData('commander').defenders
+
+class TeamHasEnemyFlag(Task):
+    def run(self):
+        commander = self.getData('commander')
+        return commander.game.enemyTeam.flag.carrier != None
+
+class BotHasFlag(Task):
+    def run(self):
+        return self.getData('bot') == self.getData('commander').game.enemyTeam.flag.carrier
+
+class LookRandom(Task):
+    def run(self):
+        self.getData('commander').issue(commands.Defend, self.getData('bot'), Vector2(random.random()*2 - 1, random.random()*2 - 1), description = 'Looking in random direction')
+        return True
+
+class ChargeFlag(Task):
+    def run(self):
+        bot = self.getData('bot')
+        level = self.getData('commander').level
+        if bot.state != bot.STATE_SHOOTING and bot.state != bot.STATE_CHARGING and bot.state != bot.STATE_TAKINGORDERS:
+            self.getData('commander').issue(commands.Charge, self.getData('bot'), self.getData('commander').game.enemyTeam.flag.position, description = 'Rushing enemy flag')
+        return True
+
+class ChargeToFlagFlank(Task):
+    def run(self):
+        bot = self.getData('bot')
+        level = self.getData('commander').level
+        if bot.state != bot.STATE_SHOOTING and bot.state != bot.STATE_CHARGING and bot.state != bot.STATE_TAKINGORDERS:
+            flankPos = self.getData('commander').getFlankingPosition(bot, self.getData('commander').game.enemyTeam.flag.position)
+            self.getData('commander').issue(commands.Charge, self.getData('bot'), flankPos, description = 'Rushing enemy flag via flank')
+        return True
+
+
+class AttackFlag(Task):
+    def run(self):
+        bot = self.getData('bot')
+        cmdr = self.getData('commander')
+        # knownEnemyPos = []
+        # for enemy in cmdr.game.enemyTeam.members:
+        #     if enemy.position != None and enemy.seenlast <= 10 and distTo(bot.position, enemy.position) <= cmdr.level.firingDistance:
+        #         knownEnemyPos.append(enemy.position)
+        if bot.state != bot.STATE_SHOOTING and bot.state != bot.STATE_ATTACKING and bot.state != bot.STATE_TAKINGORDERS:
+            #if len(knownEnemyPos) == 0:
+                cmdr.issue(commands.Attack, bot, cmdr.game.enemyTeam.flag.position, description = 'Attacking enemy flag')
+            #else:
+                #cmdr.issue(commands.Attack, bot, cmdr.game.enemyTeam.flag.position, random.choice(knownEnemyPos), description = 'Attacking enemy flag while looking')
+        return True    
+
+class WithinShootingDistance(Task):
+    def __init__(self):
+        self.shootingDistance = self.getData('commander').level.firingDistance
+
+    def run(self):
+        return distTo(self.getData('bot').position, self.getData('targetPos')) < self.shootingDistance
+
+class RunToScoreZone(Task):
+    def run(self):
+        bot = self.getData('bot')
+        if bot.state != bot.STATE_SHOOTING and bot.state != bot.STATE_CHARGING and bot.state != bot.STATE_TAKINGORDERS:        
+            self.getData('commander').issue(commands.Charge, self.getData('bot'), self.getData('commander').game.team.flagScoreLocation, description = 'Taking their flag home')
+        return True
+
+class AllyHasFlag(Task):
+    def run(self):
+        for b in self.getData('commander').game.bots_alive:
+            if b == self.getData('commander').game.enemyTeam.flag.carrier:
+                return True
+        return False
+
+class SecureEnemyFlagObjective(Task):
+    def run(self):
+        bot = self.getData('bot')
+        cmdr = self.getData('commander')
+        flagSpawnLoc = cmdr.game.enemyTeam.flagSpawnLocation
+        flagScoreLoc = cmdr.game.enemyTeam.flagScoreLocation
+
+        # secure their flag spawn or their flag capture zone; whichever is closer
+        flagSpawnDist = distTo(bot.position, flagSpawnLoc)
+        capZoneDist = distTo(bot.position, flagScoreLoc)
+
+        secureLoc = None
+        secureDist = flagSpawnDist
+        if flagSpawnDist < capZoneDist:
+            secureLoc = flagSpawnLoc
+            secureDist = flagSpawnDist
+        else:
+            secureLoc = flagScoreLoc
+            secureDist = capZoneDist
+        
+        if secureDist < 2:
+            if bot.state != bot.STATE_SHOOTING and bot.state != bot.STATE_DEFENDING and bot.state != bot.STATE_TAKINGORDERS:
+                # TODO face direction(s) that the attackers will most likely come from
+                direction = (cmdr.midPoint - bot.position).normalized() + (random.random() - 0.5)
+                dirLeft = Vector2(-direction.y, direction.x)
+                dirRight = Vector2(direction.y, -direction.x)
+                cmdr.issue(commands.Defend, bot, [(direction, 1.0), (dirLeft, 1.0), (direction, 1.0), (dirRight, 1.0)], description = 'Keeping flag objective secure')
+        else:
+            enemiesAlive = False
+            for b in cmdr.game.enemyTeam.members:
+                if b.health != None and b.health > 0:
+                    enemiesAlive = True
+                    break
+
+            if enemiesAlive:
+                if bot.state != bot.STATE_SHOOTING and bot.state != bot.STATE_ATTACKING and bot.state != bot.STATE_TAKINGORDERS:
+                    cmdr.issue(commands.Attack, bot, secureLoc, description = 'Moving to secure enemy flag objective')
+            else:
+                if bot.state != bot.STATE_SHOOTING and bot.state != bot.STATE_CHARGING and bot.state != bot.STATE_TAKINGORDERS:
+                    cmdr.issue(commands.Charge, bot, secureLoc, description = 'Charging to secure enemy flag objective')                
+        return True
+
+class NearEnemyFlag(Task):
+    def run(self):
+        bot = self.getData('bot')
+        #print distTo(bot.position, self.getData('commander').game.enemyTeam.flag.position) < self.getData('commander').level.firingDistance * 1.5
+        return distTo(bot.position, self.getData('commander').game.enemyTeam.flag.position) < self.getData('commander').level.firingDistance * 1.5
+
+class EnemiesAreAlive(Task):
+    def run(self):
+        for bot in self.getData('commander').game.enemyTeam.members:
+            if bot.health != None and bot.health > 0:
+                return True
+        return False
+
+# Defender bot code
+
+class OurFlagIsInBase(Task):
+    def run(self):
+        ourFlag = self.getData('commander').game.team.flag
+        ourFlagSpawnLoc = self.getData('commander').game.team.flagSpawnLocation
+        return distTo(ourFlag.position, ourFlagSpawnLoc) < 3
+
+class OurFlagIsOnOurHalf(Task):
+    def run(self):
+        cmdr = self.getData('commander')
+        flagDistToSpawn = distTo(cmdr.game.team.flag.position, cmdr.game.team.flagSpawnLocation)
+        flagDistToScore = distTo(cmdr.game.team.flag.position, cmdr.game.enemyTeam.flagScoreLocation)
+        return flagDistToSpawn < flagDistToScore
+
+class SecureOurFlag(Task):
+    def run(self):
+        cmdr = self.getData('commander')
+        bot = self.getData('bot')
+        secureLoc = cmdr.game.team.flag.position
+        secureDist = distTo(bot.position, secureLoc)
+        
+        if secureDist < 2:
+            if bot.state != bot.STATE_SHOOTING and bot.state != bot.STATE_DEFENDING and bot.state != bot.STATE_TAKINGORDERS:
+                # TODO face direction(s) that the attackers will most likely come from
+                direction = (cmdr.midPoint - bot.position).normalized() + (random.random() - 0.5)
+                dirLeft = Vector2(-direction.y, direction.x)
+                dirRight = Vector2(direction.y, -direction.x)
+                cmdr.issue(commands.Defend, bot, [(direction, 1.0), (dirLeft, 1.0), (direction, 1.0), (dirRight, 1.0)], description = 'Keeping our flag secure')
+        else:
+            enemiesAlive = False
+            for b in cmdr.game.enemyTeam.members:
+                if b.health != None and b.health > 0:
+                    enemiesAlive = True
+                    break
+
+            if enemiesAlive:
+                if bot.state != bot.STATE_SHOOTING and bot.state != bot.STATE_ATTACKING and bot.state != bot.STATE_TAKINGORDERS:
+                    cmdr.issue(commands.Attack, bot, secureLoc, description = 'Moving to secure our flag')
+            else:
+                if bot.state != bot.STATE_SHOOTING and bot.state != bot.STATE_CHARGING and bot.state != bot.STATE_TAKINGORDERS:
+                    cmdr.issue(commands.Charge, bot, secureLoc, description = 'Charging to secure our flag')
+
+
+        # bot = self.getData('bot')
+        # cmdr = self.getData('commander')
+        # if bot in cmdr.game.bots_available:
+        #     cmdr.issue(commands.Attack, bot, cmdr.game.team.flag.position, description = 'Moving to secure our flag')
+        return True
+
+class SecureOurFlagStand(Task):
+    def run(self):
+        cmdr = self.getData('commander')
+        bot = self.getData('bot')
+
+        safeLocs = cmdr.secureFlagDefenseLocs
+        #print str(safeLocs[:len(self.getData('commander').defenders)-1])
+        #chosenLoc = random.choice(safeLocs[:len(self.getData('commander').defenders)-1])
+        secureLoc = None
+        secureDist = None
+        chosenLoc = None
+
+        if len(safeLocs) == 0:
+            secureLoc = cmdr.game.team.flagSpawnLocation
+        else:
+            # double check to make sure we have a good position; note that this shouldn't be done here
+            for i, sLoc in enumerate(safeLocs):
+                if distTo(Vector2(sLoc[0] + .5, sLoc[1] + .5), cmdr.game.team.flagSpawnLocation + Vector2(.5,.5)) <= cmdr.level.firingDistance - 1:
+                    chosenLoc = safeLocs[i]
+                    break
+            if chosenLoc == None:
+                chosenLoc = secureLoc = cmdr.game.team.flagSpawnLocation
+
+            secureLoc = Vector2(chosenLoc[0] + 0.5, chosenLoc[1] + 0.5)
+            secureDist = distTo(bot.position, secureLoc)
+
+        if secureDist < .5:
+            if bot.state != bot.STATE_SHOOTING and bot.state != bot.STATE_DEFENDING and bot.state != bot.STATE_TAKINGORDERS:
+                # TODO face direction(s) that the attackers will most likely come from
+                #direction = (cmdr.midPoint - bot.position).normalized() + (random.random() - 0.5)
+                #dirLeft = Vector2(-direction.y, direction.x)
+                #dirRight = Vector2(direction.y, -direction.x)
+                #cmdr.issue(commands.Defend, bot, [(direction, 1.0), (dirLeft, 1.0), (direction, 1.0), (dirRight, 1.0)], description = 'Keeping our flag stand secure')
+                
+                # face away from adjacent walls
+                directions = []
+                secureLocCell = (int(secureLoc.x), int(secureLoc.y))
+
+                for aCell in getVonNeumannNeighborhood(secureLocCell, cmdr.level.blockHeights, 1):
+                    if aCell != secureLocCell:
+                        if cmdr.level.blockHeights[aCell[0]][aCell[1]] <= 1:
+                            aimDir = Vector2(aCell[0], aCell[1]) - Vector2(secureLocCell[0], secureLocCell[1])
+                            aimDist = unblockedDistInDir(secureLoc, aimDir, cmdr)
+                            #print str(aimDir) + " : " + str(aimDist)
+                            if aimDist > cmdr.level.firingDistance / 3:
+                                directions.append(aimDir.normalized())
+
+                if len(directions) > 0:
+                    #print str(directions)
+                    cmdr.issue(commands.Defend, bot, directions, description = 'Keeping our flag stand secure')
+                else:
+                    cmdr.issue(commands.Defend, bot, (cmdr.game.team.flagSpawnLocation - bot.position).normalized(), description = 'Keeping our flag stand secure')    
+        else:
+            enemiesAlive = False
+            for b in cmdr.game.enemyTeam.members:
+                if b.health != None and b.health > 0:
+                    enemiesAlive = True
+                    break
+
+            if enemiesAlive:
+                if bot.state != bot.STATE_SHOOTING and bot.state != bot.STATE_ATTACKING and bot.state != bot.STATE_TAKINGORDERS:
+                    #print "preAttack = " + str(bot.state)
+                    #print "Commander issuing attack for bot " + str(bot.name) + " to location " + str(secureLoc)
+                    cmdr.issue(commands.Attack, bot, secureLoc, description = 'Moving to secure our flag stand')
+                    #print "postAttack = " + str(bot.state)
+            else:
+                if bot.state != bot.STATE_SHOOTING and bot.state != bot.STATE_CHARGING and bot.state != bot.STATE_TAKINGORDERS:
+                    #print "preCharge = " + str(bot.state)
+                    cmdr.issue(commands.Charge, bot, secureLoc, description = 'Charging to secure our flag stand')
+                    #print "Commander issuing charge for bot " + str(bot.name) + " to location " + str(secureLoc)
+                    #print "postCharge = " + str(bot.state)
+        return True
