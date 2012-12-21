@@ -4,10 +4,6 @@
 # Author:  Nick Caplinger (SleekoNiko)
 # Dependencies:  numpy, pypng
 
-# Modules to consider:
-# graph-tool
-# numpy
-
 # Ideas:
 # attackers study timing of defenders
 # control the midfield with gankers - betweenEnemyCarrierAndScoreZone method or shorter:  canInterceptCarrier
@@ -147,7 +143,7 @@ class SleekoCommander(Commander):
         self.behaviorTree.root.blackboard = {}
         self.behaviorTree.root.blackboard['commander'] = self
 
-        
+        # I was using a png file for output
         #bt = getVonNeumannNeighborhood((int(self.game.team.flagSpawnLocation.x), int(self.game.team.flagSpawnLocation.y)), self.level.blockHeights, int(self.level.firingDistance))
         #createPngFromBlockTuples(bt, (self.level.width, self.level.height))
         #createPngFromMatrix(bt, (self.level.width, self.level.height))
