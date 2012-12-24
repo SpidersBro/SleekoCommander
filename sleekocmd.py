@@ -5,9 +5,10 @@
 # Dependencies:  numpy, pypng
 
 # Ideas:
-# attackers study timing of defenders
-# control the midfield with gankers - betweenEnemyCarrierAndScoreZone method or shorter:  canInterceptCarrier
-# determine best defending position
+# control the midfield with gankers
+  #1. Ambush flag carriers by predicting their path to the flag stand and whether or not they can intercept
+  #2. Camp the enemy spawn
+  #3. Actively search around points of interest to gain map awareness
 
 # Import AI Sandbox API:
 from api import Commander
