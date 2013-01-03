@@ -95,6 +95,7 @@ class SleekoCommander(Commander):
                                             ]),
                                     Sequence([ 
                                             Inverter(TeamHasEnemyFlag()), 
+                                            #SmartApproachFlag()
                                             Selector([
                                                     Sequence([
                                                             NearEnemyFlag(),
@@ -164,7 +165,7 @@ class SleekoCommander(Commander):
             if lastCombatEvent.type == lastCombatEvent.TYPE_KILLED:
                 if lastCombatEvent.subject in self.game.team.members:
                     self.botDeathLocations.append(lastCombatEvent.subject.position)
-                    self.updateRunnerGraph()
+                    #self.updateRunnerGraph()
             self.lastEventCount = len(self.game.match.combatEvents)
 
 
@@ -257,11 +258,13 @@ class SleekoCommander(Commander):
         #g.edge_properties['weight'] = self.weights
     
         self.terrain = []
+        self.positions = {}
         for j in range(0, height):
             row = []
             for i in range(0,width):
                 if blocks[i][j] == 0:
                     g.add_node(i+j*width, position = (float(i)+0.5, float(j)+0.5) )
+                    self.positions[i+j*width] = Vector2(float(i) + 0.5, float(j) + 0.5)
                     row.append(i+j*width)
                 else:
                     row.append(None)
@@ -308,7 +311,7 @@ class SleekoCommander(Commander):
     def getNodeIndex(self, position):
         i = int(position.x)
         j = int(position.y)
-        width = self.graph.graph["map_width"]
+        width = self.runnerGraph.graph["map_width"]
         return i+j*width
 
 # Helper functions
@@ -501,19 +504,24 @@ class ChargeFlag(Task):
 
 class SmartApproachFlag(Task):
     def run(self):
-        # calculate the shortest path between the bot and the target using our weights
-        srcIndex = self.getNodeIndex(bot.position)
-        dstIndex = self.getNodeIndex(dst)
-        pathNodes = nx.shortest_path(self.graph, srcIndex, dstIndex, 'weight')
+        bot = self.getData('bot')
+        cmdr = self.getData('commander')
 
-        pathLength = len(pathNodes)
-        if pathLength > 0:
-            path = [self.positions[p] for p in pathNodes if self.positions[p]]
-            if len(path) > 0:
-                orderPath = path[::10]
-                orderPath.append(path[-1]) # take every 10th point including last point
-                self.issue(commands.Move, bot, orderPath, description = message) 
-                self.paths[bot] = path    # store the path for visualization
+        if bot.state != bot.STATE_SHOOTING and bot.state != bot.STATE_CHARGING and bot.state != bot.STATE_TAKINGORDERS:
+            dst = cmdr.game.enemyTeam.flag.position
+            message = "Intelligently approaching flag?"
+            # calculate the shortest path between the bot and the target using our weights
+            srcIndex = cmdr.getNodeIndex(bot.position)
+            dstIndex = cmdr.getNodeIndex(dst)
+            pathNodes = nx.shortest_path(cmdr.runnerGraph, srcIndex, dstIndex, 'weight')
+
+            pathLength = len(pathNodes)
+            if pathLength > 0:
+                path = [cmdr.positions[p] for p in pathNodes if cmdr.positions[p]]
+                if len(path) > 0:
+                    orderPath = path[::10]
+                    orderPath.append(path[-1]) # take every 10th point including last point
+                    cmdr.issue(commands.Charge, bot, orderPath, description = message) 
 
 class ChargeToFlagFlank(Task):
     def run(self):
